@@ -25,11 +25,13 @@ jobs:
           password: ${{ secrets.CR_TOKEN }}
 
       - name: Build and push Docker images
-        uses: docker/build-push-action@v2
+        uses: docker/build-push-action@v4
         with:
           context: .
           push: true
-          tags: ghcr.io/vladislavsivtsov/md-sa2-31-25:10
+          tags: 
+                ghcr.io/VladislavSivtsov/md-sa2-31-25:latest
+                ghcr.io/VladislavSivtsov/md-sa2-31-25:${{ github.sha }}
       
       - name: Slack Notification
         if: always()
