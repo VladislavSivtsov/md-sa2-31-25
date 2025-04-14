@@ -29,9 +29,8 @@ jobs:
         with:
           context: .
           push: true
-          tags: |
-                ghcr.io/VladislavSivtsov/md-sa2-31-25:latest
-                ghcr.io/VladislavSivtsov/md-sa2-31-25:${{ github.sha }}
+          tags: ghcr.io/VladislavSivtsov/md-sa2-31-25:latest
+                 
       
       - name: Slack Notification
         if: always()
