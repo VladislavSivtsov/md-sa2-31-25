@@ -39,10 +39,10 @@ jobs:
         env:
           SLACK_CHANNEL: devops
           SLACK_COLOR: ${{ job.status }} # or a specific color like 'good' or '#ff00ff'
-          SLACK_ICON: https://github.com/Vlados.png?size=48
+          SLACK_ICON: https://github.com/devops.png?size=48
           SLACK_MESSAGE: 'Post Content :rocket:'
           SLACK_TITLE: Post Title
-          SLACK_USERNAME: Vlados
+          SLACK_USERNAME: devops
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
   
       
