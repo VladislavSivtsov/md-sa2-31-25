@@ -29,7 +29,7 @@ jobs:
         with:
           context: .
           push: true
-          tags: 
+          tags: |
                 ghcr.io/VladislavSivtsov/md-sa2-31-25:latest
                 ghcr.io/VladislavSivtsov/md-sa2-31-25:${{ github.sha }}
       
