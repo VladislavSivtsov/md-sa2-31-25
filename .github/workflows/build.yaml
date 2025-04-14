@@ -30,5 +30,16 @@ jobs:
           context: .
           push: true
           tags: ghcr.io/vladislavsivtsov/md-sa2-31-25:10
+      
+      - name: Slack Notification
+        if: always()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_TITLE: "Image build result for ${{ github.repository }}"
+          SLACK_COLOR: ${{ job.status }}
+          SLACK_MESSAGE: |
+            Result is ${{ job.status }}
+            Commit message: ${{ github.event.head_commit.message }}
 
       
