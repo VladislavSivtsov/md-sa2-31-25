@@ -3,46 +3,63 @@ name: KinD Cluster Setup
 on:
   push:
     branches:
-      - master  
+      - master
 
 jobs:
   setup-kind-cluster:
-    runs-on: ubuntu-latest  
-    
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       
-    - name: Set up KinD cluster
-      id: kind-setup
-      uses: engineerd/setup-kind@v0.7.0
-      with:
-        version: "v0.20.0" 
-        config: |
-          kind: Cluster
-          apiVersion: kind.x-k8s.io/v1alpha4
-          nodes:
-          - role: control-plane
-          - role: worker
-          
-    - name: Verify cluster
+    - name: Install KinD manually
       run: |
-        # Cluster timing information
-        echo "=== Cluster Setup Time ==="
-        echo "Start time: ${{ steps.kind-setup.outputs.start-time }}"
-        echo "Ready time: $(date -u +'%Y-%m-%d %H:%M:%S')"
+        # Install KinD
+        curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+        chmod +x ./kind
+        sudo mv ./kind /usr/local/bin/kind
         
-        # Kubernetes version information
-        echo -e "\n=== Kubernetes Version ==="
-        kubectl version --output=json | jq -r '.serverVersion.gitVersion'
+        # Install kubectl
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
         
-        # Node information
-        echo -e "\n=== Node Details ==="
-        kubectl get nodes -o wide
-        echo -e "\nNumber of nodes: $(kubectl get nodes --no-headers | wc -l)"
+    - name: Create cluster
+      run: |
+        start_time=$(date +%s)
         
-        # Detailed cluster information
-        echo -e "\n=== Cluster Details ==="
+        cat <<EOF | kind create cluster --config=-
+        kind: Cluster
+        apiVersion: kind.x-k8s.io/v1alpha4
+        nodes:
+        - role: control-plane
+        - role: worker
+        EOF
+        
+        end_time=$(date +%s)
+        echo "CLUSTER_SETUP_TIME=$((end_time - start_time))" >> $GITHUB_ENV
+          
+    - name: Get cluster info
+      run: |
+        echo "=== Cluster Information ==="
         kubectl cluster-info
-        echo -e "\n=== System Pods ==="
-        kubectl get pods -n kube-system --no-headers | wc -l | awk '{print "System pods running:", $1}'
+        
+        echo -e "\n=== Node Details ==="
+        echo -n "Number of nodes: "
+        kubectl get nodes -o name | wc -l
+        kubectl get nodes -o wide
+        
+        echo -e "\n=== Version Information ==="
+        echo -n "Kubernetes version: "
+        kubectl version --short 2>/dev/null | grep Server | awk '{print $3}'
+        echo -n "KinD version: "
+        kind version
+        
+        echo -e "\n=== Cluster Components ==="
+        echo -n "System pods running: "
+        kubectl get pods -n kube-system --no-headers | wc -l
+        
+        echo -e "\n=== Performance Metrics ==="
+        echo "Cluster creation time: ${CLUSTER_SETUP_TIME} seconds"
