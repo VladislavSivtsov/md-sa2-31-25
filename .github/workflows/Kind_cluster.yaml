@@ -1,11 +1,11 @@
   name: KinD Cluster Setup
 
- on:
+  on:
   push:
     branches:
       - master  
 
- jobs:
+  jobs:
   setup-kind-cluster:
     runs-on: ubuntu-latest  
     
