@@ -1,8 +1,8 @@
   name: KinD Cluster Setup
 
   on:
-  push:
-    branches:
+    push:
+      branches:
       - master  
 
   jobs:
