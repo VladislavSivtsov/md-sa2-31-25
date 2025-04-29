@@ -1,24 +1,28 @@
-name: Kubernetes Pods Check with Fixed SSH
+name: Kubernetes Pod Monitoring with SSH Fix
 
 on:
   workflow_dispatch:
 
 jobs:
-  check-pods:
+  monitor-pods:
     runs-on: ubuntu-latest
 
     steps:
-      # Шаг 1: Настройка SSH-ключа
-      - name: Setup SSH Key
+      # Шаг 1: Настройка SSH ключа
+      - name: Setup SSH Environment
         run: |
           mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           
-          # Проверяем что ключ валидный
-          ssh-keygen -l -f ~/.ssh/id_ed25519 || echo "Key validation failed"
+          # Проверка ключа
+          if ! ssh-keygen -l -f ~/.ssh/id_ed25519; then
+            echo "::error::Invalid SSH key format"
+            exit 1
+          fi
 
-      # Шаг 2: Настройка SSH config
+      # Шаг 2: Настройка SSH конфига
       - name: Configure SSH
         run: |
           cat <<EOF > ~/.ssh/config
@@ -28,6 +32,7 @@ jobs:
             Port 32510
             IdentityFile ~/.ssh/id_ed25519
             StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
 
           Host remote-host-1
             HostName 192.168.208.17
@@ -36,7 +41,8 @@ jobs:
             ProxyJump bastion
             IdentityFile ~/.ssh/id_ed25519
             StrictHostKeyChecking no
-            ServerAliveInterval 60
+            UserKnownHostsFile /dev/null
+            ServerAliveInterval 30
 
           Host remote-host-2
             HostName 192.168.203.9
@@ -45,89 +51,80 @@ jobs:
             ProxyJump bastion
             IdentityFile ~/.ssh/id_ed25519
             StrictHostKeyChecking no
-            ServerAliveInterval 60
+            UserKnownHostsFile /dev/null
+            ServerAliveInterval 30
           EOF
 
-      # Шаг 3: Добавление known hosts
-      - name: Add to Known Hosts
+      # Шаг 3: Проверка подключения к bastion
+      - name: Verify Bastion Connection
         run: |
-          ssh-keyscan -p 32510 178.124.206.53 >> ~/.ssh/known_hosts
-          ssh-keyscan -p 22 192.168.208.17 >> ~/.ssh/known_hosts
-          ssh-keyscan -p 22 192.168.203.9 >> ~/.ssh/known_hosts
-
-      # Шаг 4: Проверка подключения
-      - name: Test SSH Connection
-        run: |
-          echo "Testing connection to remote-host-1..."
-          ssh -v remote-host-1 'echo "Connection to host 1 successful"'
-          
-          echo "Testing connection to remote-host-2..."
-          ssh -v remote-host-2 'echo "Connection to host 2 successful"'
-
-      # Шаг 5: Проверка подов на первом хосте
-      - name: Check Pods on Host 1
-        run: |
-          set +e
-          ssh remote-host-1 'kubectl get pods -A' > pods_output_1.txt
-          RC=$?
-          
-          if [ $RC -ne 0 ]; then
-            echo "SSH command failed with exit code $RC"
-            echo "Debug info:"
-            cat ~/.ssh/config
-            ls -la ~/.ssh/
-            exit $RC
-          fi
-          
-          echo "=== Pods on Host 1 ==="
-          cat pods_output_1.txt
-          
-          awk '$4 != "Running" && NR > 1' pods_output_1.txt > not_running_1.txt || true
-          
-          if [ -s not_running_1.txt ]; then
-            echo "Found non-Running pods on Host 1"
-            TEXT=$(sed 's/"/\\"/g' not_running_1.txt | awk '{printf "%s\\n", $0}')
-            curl -X POST -H 'Content-type: application/json' \
-              --data "{\"text\":\"*Non-Running Pods on Host 1:*\n\`\`\`$TEXT\`\`\`\"}" \
-              ${{ secrets.SLACK_WEBHOOK }}
-          else
-            echo "All pods on Host 1 are Running"
+          echo "Testing bastion connection..."
+          ssh -T bastion 'echo "Successfully connected to bastion"'
+          if [ $? -ne 0 ]; then
+            echo "::error::Failed to connect to bastion"
+            exit 1
           fi
 
-      # Шаг 6: Проверка подов на втором хосте
-      - name: Check Pods on Host 2
+      # Шаг 4: Добавление ключа на целевые хосты (через bastion)
+      - name: Deploy SSH Key to Targets
         run: |
-          set +e
-          ssh remote-host-2 'kubectl get pods -A' > pods_output_2.txt
-          RC=$?
+          set -x
+          PUB_KEY=$(ssh-keygen -y -f ~/.ssh/id_ed25519)
           
-          if [ $RC -ne 0 ]; then
-            echo "SSH command failed with exit code $RC"
-            exit $RC
-          fi
-          
-          echo "=== Pods on Host 2 ==="
-          cat pods_output_2.txt
-          
-          awk '$4 != "Running" && NR > 1' pods_output_2.txt > not_running_2.txt || true
-          
-          if [ -s not_running_2.txt ]; then
-            echo "Found non-Running pods on Host 2"
-            TEXT=$(sed 's/"/\\"/g' not_running_2.txt | awk '{printf "%s\\n", $0}')
-            curl -X POST -H 'Content-type: application/json' \
-              --data "{\"text\":\"*Non-Running Pods on Host 2:*\n\`\`\`$TEXT\`\`\`\"}" \
-              ${{ secrets.SLACK_WEBHOOK }}
-          else
-            echo "All pods on Host 2 are Running"
-          fi
+          for TARGET in remote-host-1 remote-host-2; do
+            echo "Deploying key to $TARGET..."
+            
+            ssh $TARGET "
+              mkdir -p ~/.ssh
+              grep -qF '$PUB_KEY' ~/.ssh/authorized_keys || echo '$PUB_KEY' >> ~/.ssh/authorized_keys
+              chmod 700 ~/.ssh
+              chmod 600 ~/.ssh/authorized_keys
+              echo 'Key deployed to $TARGET'
+            " || echo "::warning::Key deployment to $TARGET may have failed"
+          done
 
-      # Шаг 7: Сохранение результатов
+      # Шаг 5: Проверка подов с улучшенной обработкой ошибок
+      - name: Check Pod Status
+        run: |
+          set -eo pipefail
+          
+          check_pods() {
+            HOST=$1
+            OUTPUT_FILE="pods_${HOST}.txt"
+            ERROR_FILE="error_${HOST}.log"
+            
+            echo "Checking pods on $HOST..."
+            
+            if ! ssh $HOST 'kubectl get pods -A' > $OUTPUT_FILE 2>$ERROR_FILE; then
+              echo "::error::Failed to check pods on $HOST"
+              cat $ERROR_FILE
+              return 1
+            fi
+            
+            echo "=== Pods on $HOST ==="
+            cat $OUTPUT_FILE
+            
+            awk '$4 != "Running" && NR > 1' $OUTPUT_FILE > "not_running_${HOST}.txt" || true
+            
+            if [ -s "not_running_${HOST}.txt" ]; then
+              echo "::warning::Non-Running pods found on $HOST"
+              TEXT=$(sed 's/"/\\"/g' "not_running_${HOST}.txt" | awk '{printf "%s\\n", $0}')
+              curl -X POST -H 'Content-type: application/json' \
+                --data "{\"text\":\"*Non-Running Pods on ${HOST}:*\n\`\`\`$TEXT\`\`\`\"}" \
+                ${{ secrets.SLACK_WEBHOOK }}
+            fi
+          }
+          
+          check_pods remote-host-1
+          check_pods remote-host-2
+
+      # Шаг 6: Сохранение результатов
       - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
           name: pod-status-reports
           path: |
-            pods_output_1.txt
-            not_running_1.txt
-            pods_output_2.txt
-            not_running_2.txt 
+            pods_remote-host-1.txt
+            not_running_remote-host-1.txt
+            pods_remote-host-2.txt
+            not_running_remote-host-2.txt 
