@@ -20,7 +20,7 @@ jobs:
           # Создаём директорию для SSH
           mkdir -p ~/.ssh
           echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519 
-          chmod 600 ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_ed25519
           # Параметры подключения для первого хоста
           BASTION_IP="178.124.206.53"        # Укажите IP вашего Bastion сервера
           BASTION_USER="jump_sa"            # Укажите имя пользователя для Bastion
