@@ -1,112 +1,128 @@
-name: Check Kubernetes pods with SSH key setup
+name: Kubernetes Pods Check with Fixed SSH
 
 on:
   workflow_dispatch:
 
 jobs:
-  deploy-and-check:
+  check-pods:
     runs-on: ubuntu-latest
 
     steps:
-      # Шаг 1: Настройка SSH
-      - name: Set up SSH
-        uses: webfactory/ssh-agent@v0.5.3
-        with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
-
-      # Шаг 2: Создаем конфигурацию SSH
-      - name: Configure SSH
+      # Шаг 1: Настройка SSH-ключа
+      - name: Setup SSH Key
         run: |
           mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
+          
+          # Проверяем что ключ валидный
+          ssh-keygen -l -f ~/.ssh/id_ed25519 || echo "Key validation failed"
 
+      # Шаг 2: Настройка SSH config
+      - name: Configure SSH
+        run: |
           cat <<EOF > ~/.ssh/config
           Host bastion
-            Hostname 178.124.206.53
+            HostName 178.124.206.53
             User jump_sa
             Port 32510
             IdentityFile ~/.ssh/id_ed25519
+            StrictHostKeyChecking no
 
           Host remote-host-1
-            Hostname 192.168.208.17
+            HostName 192.168.208.17
             User root
             Port 22
             ProxyJump bastion
             IdentityFile ~/.ssh/id_ed25519
+            StrictHostKeyChecking no
+            ServerAliveInterval 60
 
           Host remote-host-2
-            Hostname 192.168.203.9
+            HostName 192.168.203.9
             User root
             Port 22
             ProxyJump bastion
             IdentityFile ~/.ssh/id_ed25519
+            StrictHostKeyChecking no
+            ServerAliveInterval 60
           EOF
 
-      # Шаг 3: Добавляем ключ на целевые хосты
-      - name: Add SSH key to target hosts
+      # Шаг 3: Добавление known hosts
+      - name: Add to Known Hosts
         run: |
-          # Генерируем публичный ключ из приватного
-          PUB_KEY=$(ssh-keygen -y -f ~/.ssh/id_ed25519)
+          ssh-keyscan -p 32510 178.124.206.53 >> ~/.ssh/known_hosts
+          ssh-keyscan -p 22 192.168.208.17 >> ~/.ssh/known_hosts
+          ssh-keyscan -p 22 192.168.203.9 >> ~/.ssh/known_hosts
 
-          # Функция для добавления ключа на хост
-          add_key_to_host() {
-            host=$1
-            echo "Adding key to $host..."
-            ssh -o StrictHostKeyChecking=no $host \
-              "mkdir -p ~/.ssh && \
-              echo '$PUB_KEY' >> ~/.ssh/authorized_keys && \
-              chmod 700 ~/.ssh && \
-              chmod 600 ~/.ssh/authorized_keys && \
-              echo 'Key added successfully to $host'"
-          }
-
-          # Добавляем ключ на оба хоста
-          add_key_to_host remote-host-1
-          add_key_to_host remote-host-2
-
-      # Шаг 4: Проверяем подключение
-      - name: Test SSH connection
+      # Шаг 4: Проверка подключения
+      - name: Test SSH Connection
         run: |
-          ssh -o StrictHostKeyChecking=no remote-host-1 'echo "Successfully connected to host 1"'
-          ssh -o StrictHostKeyChecking=no remote-host-2 'echo "Successfully connected to host 2"'
-
-      # Шаг 5: Проверяем поды (оригинальная логика)
-      - name: Check pods on host 1
-        run: |
-          ssh remote-host-1 'kubectl get pods -A' > pods_output_1.txt
+          echo "Testing connection to remote-host-1..."
+          ssh -v remote-host-1 'echo "Connection to host 1 successful"'
           
-          echo "=== Pods on host 1 ==="
+          echo "Testing connection to remote-host-2..."
+          ssh -v remote-host-2 'echo "Connection to host 2 successful"'
+
+      # Шаг 5: Проверка подов на первом хосте
+      - name: Check Pods on Host 1
+        run: |
+          set +e
+          ssh remote-host-1 'kubectl get pods -A' > pods_output_1.txt
+          RC=$?
+          
+          if [ $RC -ne 0 ]; then
+            echo "SSH command failed with exit code $RC"
+            echo "Debug info:"
+            cat ~/.ssh/config
+            ls -la ~/.ssh/
+            exit $RC
+          fi
+          
+          echo "=== Pods on Host 1 ==="
           cat pods_output_1.txt
           
           awk '$4 != "Running" && NR > 1' pods_output_1.txt > not_running_1.txt || true
           
           if [ -s not_running_1.txt ]; then
+            echo "Found non-Running pods on Host 1"
             TEXT=$(sed 's/"/\\"/g' not_running_1.txt | awk '{printf "%s\\n", $0}')
             curl -X POST -H 'Content-type: application/json' \
-              --data "{\"text\":\"*Problem pods on host 1:*\n\`\`\`$TEXT\`\`\`\"}" \
+              --data "{\"text\":\"*Non-Running Pods on Host 1:*\n\`\`\`$TEXT\`\`\`\"}" \
               ${{ secrets.SLACK_WEBHOOK }}
+          else
+            echo "All pods on Host 1 are Running"
           fi
 
-      - name: Check pods on host 2
+      # Шаг 6: Проверка подов на втором хосте
+      - name: Check Pods on Host 2
         run: |
+          set +e
           ssh remote-host-2 'kubectl get pods -A' > pods_output_2.txt
+          RC=$?
           
-          echo "=== Pods on host 2 ==="
+          if [ $RC -ne 0 ]; then
+            echo "SSH command failed with exit code $RC"
+            exit $RC
+          fi
+          
+          echo "=== Pods on Host 2 ==="
           cat pods_output_2.txt
           
           awk '$4 != "Running" && NR > 1' pods_output_2.txt > not_running_2.txt || true
           
           if [ -s not_running_2.txt ]; then
+            echo "Found non-Running pods on Host 2"
             TEXT=$(sed 's/"/\\"/g' not_running_2.txt | awk '{printf "%s\\n", $0}')
             curl -X POST -H 'Content-type: application/json' \
-              --data "{\"text\":\"*Problem pods on host 2:*\n\`\`\`$TEXT\`\`\`\"}" \
+              --data "{\"text\":\"*Non-Running Pods on Host 2:*\n\`\`\`$TEXT\`\`\`\"}" \
               ${{ secrets.SLACK_WEBHOOK }}
+          else
+            echo "All pods on Host 2 are Running"
           fi
 
-      # Шаг 6: Сохраняем результаты
-      - name: Upload results
+      # Шаг 7: Сохранение результатов
+      - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
           name: pod-status-reports
@@ -114,4 +130,4 @@ jobs:
             pods_output_1.txt
             not_running_1.txt
             pods_output_2.txt
-            not_running_2.txt
+            not_running_2.txt 
