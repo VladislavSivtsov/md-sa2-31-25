@@ -1,130 +1,125 @@
-name: Kubernetes Pod Monitoring with SSH Fix
+name: Check status of pods and Slack notification
 
 on:
   workflow_dispatch:
 
 jobs:
-  monitor-pods:
+  connect:
     runs-on: ubuntu-latest
 
     steps:
-      # Шаг 1: Настройка SSH ключа
-      - name: Setup SSH Environment
-        run: |
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          
-          # Проверка ключа
-          if ! ssh-keygen -l -f ~/.ssh/id_ed25519; then
-            echo "::error::Invalid SSH key format"
-            exit 1
-          fi
+      # Настроим SSH
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.5.3
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      # Шаг 2: Настройка SSH конфига
+      # Устанавливаем конфигурацию SSH для подключения через Bastion
       - name: Configure SSH
         run: |
-          cat <<EOF > ~/.ssh/config
-          Host bastion
-            HostName 178.124.206.53
-            User jump_sa
-            Port 32510
-            IdentityFile ~/.ssh/id_ed25519
-            StrictHostKeyChecking no
-            UserKnownHostsFile /dev/null
+          # Создаём директорию для SSH
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_rsa
 
-          Host remote-host-1
-            HostName 192.168.208.17
-            User root
-            Port 22
-            ProxyJump bastion
-            IdentityFile ~/.ssh/id_ed25519
-            StrictHostKeyChecking no
-            UserKnownHostsFile /dev/null
-            ServerAliveInterval 30
+          # Параметры подключения для первого хоста
+          BASTION_IP="178.124.206.53"        # Укажите IP вашего Bastion сервера
+          BASTION_USER="jump_sa"            # Укажите имя пользователя для Bastion
+          BASTION_PORT="32510"              # Порт для Bastion сервера (по умолчанию 22)
+          REMOTE_HOST_IP="192.168.208.17"   # Укажите IP первого удалённого хоста
+          REMOTE_USER="root"                # Укажите имя пользователя для первого удалённого хоста
+          REMOTE_PORT="22"                  # Порт для удалённого хоста (по умолчанию 22)
 
-          Host remote-host-2
-            HostName 192.168.203.9
-            User root
-            Port 22
-            ProxyJump bastion
-            IdentityFile ~/.ssh/id_ed25519
-            StrictHostKeyChecking no
-            UserKnownHostsFile /dev/null
-            ServerAliveInterval 30
-          EOF
+          # Параметры подключения для второго хоста
+          REMOTE_HOST_IP_2="192.168.203.9" # Укажите IP второго удалённого хоста
+          REMOTE_USER_2="root"              # Укажите имя пользователя для второго удалённого хоста
 
-      # Шаг 3: Проверка подключения к bastion
-      - name: Verify Bastion Connection
+          # Создаём конфигурацию для SSH
+          echo "Host bastion
+          Hostname $BASTION_IP
+          User $BASTION_USER
+          Port $BASTION_PORT
+          IdentityFile ~/.ssh/id_ed25519" > ~/.ssh/config
+
+          echo "Host remote-host
+          Hostname $REMOTE_HOST_IP
+          User $REMOTE_USER
+          Port $REMOTE_PORT
+          ProxyJump bastion" >> ~/.ssh/config
+
+          echo "Host remote-host-2
+          Hostname $REMOTE_HOST_IP_2
+          User $REMOTE_USER_2
+          Port $REMOTE_PORT
+          ProxyJump bastion" >> ~/.ssh/config
+
+      # Добавляем Bastion в known_hosts
+      - name: Add bastion to known_hosts
         run: |
-          echo "Testing bastion connection..."
-          ssh -T bastion 'echo "Successfully connected to bastion"'
-          if [ $? -ne 0 ]; then
-            echo "::error::Failed to connect to bastion"
-            exit 1
+          # Добавляем Bastion в known_hosts для предотвращения ошибки "Host key verification failed"
+          ssh-keyscan -p 32510 178.124.206.53 >> ~/.ssh/known_hosts
+
+      # Добавляем удалённый хост 1 в known_hosts через Bastion
+      - name: Add remote host 1 to known_hosts via bastion
+        run: |
+          # Добавляем удалённый хост 1 в known_hosts через Bastion сервер
+          ssh -o StrictHostKeyChecking=no -p 32510 jump_sa@178.124.206.53 ssh-keyscan -p 22 192.168.208.17 >> ~/.ssh/known_hosts
+
+      # Добавляем удалённый хост 2 в known_hosts через Bastion
+      - name: Add remote host 2 to known_hosts via bastion
+        run: |
+          # Добавляем удалённый хост 2 в known_hosts через Bastion сервер
+          ssh -o StrictHostKeyChecking=no -p 32510 jump_sa@178.124.206.53 ssh-keyscan -p 22 192.168.203.9 >> ~/.ssh/known_hosts
+
+      # Выполняем команду на первом удалённом хосте через Bastion
+      - name: Run kubectl on remote host 1 and check pod statuses
+        run: |
+          ssh -o StrictHostKeyChecking=no remote-host 'kubectl get pods -A' > pods_output_1.txt
+
+          echo "=== Полный вывод kubectl для первого хоста ==="
+          cat pods_output_1.txt
+
+          echo "=== Поды не в статусе Running на первом хосте ==="
+          awk '$4 != "Running" && NR > 1' pods_output_1.txt > not_running_pods_1.txt || true
+          cat not_running_pods_1.txt || echo "Все поды на первом хосте в статусе Running"
+
+          # Если файл не пустой — шлём в Slack
+          if [ -s not_running_pods_1.txt ]; then
+            echo "🚨 Найдены поды не в статусе Running на первом хосте. Отправляем в Slack..."
+            TEXT=$(cat not_running_pods_1.txt | sed 's/"/\\"/g' | awk '{printf "%s\\n", $0}')
+            curl -X POST -H 'Content-type: application/json' \
+              --data "{\"text\":\"*Проблемные поды на первом хосте:*\n\`\`\`${TEXT}\`\`\`\"}" \
+              ${{ secrets.SLACK_WEBHOOK }}
           fi
 
-      # Шаг 4: Добавление ключа на целевые хосты (через bastion)
-      - name: Deploy SSH Key to Targets
+      # Выполняем команду на втором удалённом хосте через Bastion
+      - name: Run kubectl on remote host 2 and check pod statuses
         run: |
-          set -x
-          PUB_KEY=$(ssh-keygen -y -f ~/.ssh/id_ed25519)
-          
-          for TARGET in remote-host-1 remote-host-2; do
-            echo "Deploying key to $TARGET..."
-            
-            ssh $TARGET "
-              mkdir -p ~/.ssh
-              grep -qF '$PUB_KEY' ~/.ssh/authorized_keys || echo '$PUB_KEY' >> ~/.ssh/authorized_keys
-              chmod 700 ~/.ssh
-              chmod 600 ~/.ssh/authorized_keys
-              echo 'Key deployed to $TARGET'
-            " || echo "::warning::Key deployment to $TARGET may have failed"
-          done
+          ssh -o StrictHostKeyChecking=no remote-host-2 'kubectl get pods -A' > pods_output_2.txt
 
-      # Шаг 5: Проверка подов с улучшенной обработкой ошибок
-      - name: Check Pod Status
-        run: |
-          set -eo pipefail
-          
-          check_pods() {
-            HOST=$1
-            OUTPUT_FILE="pods_${HOST}.txt"
-            ERROR_FILE="error_${HOST}.log"
-            
-            echo "Checking pods on $HOST..."
-            
-            if ! ssh $HOST 'kubectl get pods -A' > $OUTPUT_FILE 2>$ERROR_FILE; then
-              echo "::error::Failed to check pods on $HOST"
-              cat $ERROR_FILE
-              return 1
-            fi
-            
-            echo "=== Pods on $HOST ==="
-            cat $OUTPUT_FILE
-            
-            awk '$4 != "Running" && NR > 1' $OUTPUT_FILE > "not_running_${HOST}.txt" || true
-            
-            if [ -s "not_running_${HOST}.txt" ]; then
-              echo "::warning::Non-Running pods found on $HOST"
-              TEXT=$(sed 's/"/\\"/g' "not_running_${HOST}.txt" | awk '{printf "%s\\n", $0}')
-              curl -X POST -H 'Content-type: application/json' \
-                --data "{\"text\":\"*Non-Running Pods on ${HOST}:*\n\`\`\`$TEXT\`\`\`\"}" \
-                ${{ secrets.SLACK_WEBHOOK }}
-            fi
-          }
-          
-          check_pods remote-host-1
-          check_pods remote-host-2
+          echo "=== Полный вывод kubectl для второго хоста ==="
+          cat pods_output_2.txt
 
-      # Шаг 6: Сохранение результатов
-      - name: Upload Results
+          echo "=== Поды не в статусе Running на втором хосте ==="
+          awk '$4 != "Running" && NR > 1' pods_output_2.txt > not_running_pods_2.txt || true
+          cat not_running_pods_2.txt || echo "Все поды на втором хосте в статусе Running"
+
+          # Если файл не пустой — шлём в Slack
+          if [ -s not_running_pods_2.txt ]; then
+            echo "🚨 Найдены поды не в статусе Running на втором хосте. Отправляем в Slack..."
+            TEXT=$(cat not_running_pods_2.txt | sed 's/"/\\"/g' | awk '{printf "%s\\n", $0}')
+            curl -X POST -H 'Content-type: application/json' \
+              --data "{\"text\":\"*Проблемные поды на втором хосте:*\n\`\`\`${TEXT}\`\`\`\"}" \
+              ${{ secrets.SLACK_WEBHOOK }}
+          fi
+
+      # Загружаем оба файла как артефакты
+      - name: Upload output as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pod-status-reports
+          name: script-output
           path: |
-            pods_remote-host-1.txt
-            not_running_remote-host-1.txt
-            pods_remote-host-2.txt
-            not_running_remote-host-2.txt 
+            pods_output_1.txt
+            not_running_pods_1.txt
+            pods_output_2.txt
+            not_running_pods_2.txt
