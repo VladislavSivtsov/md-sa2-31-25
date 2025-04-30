@@ -1,24 +1,28 @@
-name: Kubernetes Pod Status Monitor
+name: Kubernetes Cluster Monitoring
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '0 * * * *'  # Every hour
+
+env:
+  BASTION_IP: "178.124.206.53"
+  BASTION_USER: "jump_sa"
+  BASTION_PORT: "32510"
+  CLUSTER1_IP: "192.168.208.17"
+  CLUSTER2_IP: "192.168.203.9"
+  DEFAULT_USER: "root"
+  KUBECTL_CMD: "kubectl get pods -A --field-selector=status.phase!=Running --no-headers"
 
 jobs:
-  monitor-pods:
+  cluster-monitoring:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    
-    env:
-      BASTION_IP: "178.124.206.53"
-      BASTION_USER: "jump_sa"
-      BASTION_PORT: "32510"
-      HOST1_IP: "192.168.208.17"
-      HOST2_IP: "192.168.203.9"
-      REMOTE_USER: "root"
+    timeout-minutes: 20
 
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Setup SSH
         uses: webfactory/ssh-agent@v0.5.3
         with:
@@ -29,11 +33,11 @@ jobs:
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           
-          # Записываем приватный ключ
+          # Write private key
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           
-          # Создаем конфиг SSH
+          # Create SSH config
           cat > ~/.ssh/config <<EOF
           Host bastion
             HostName ${{ env.BASTION_IP }}
@@ -41,82 +45,147 @@ jobs:
             Port ${{ env.BASTION_PORT }}
             IdentityFile ~/.ssh/id_ed25519
             StrictHostKeyChecking no
+            ConnectTimeout 10
 
           Host cluster1
-            HostName ${{ env.HOST1_IP }}
-            User ${{ env.REMOTE_USER }}
+            HostName ${{ env.CLUSTER1_IP }}
+            User ${{ env.DEFAULT_USER }}
             ProxyJump bastion
             StrictHostKeyChecking no
+            ConnectTimeout 10
 
           Host cluster2
-            HostName ${{ env.HOST2_IP }}
-            User ${{ env.REMOTE_USER }}
+            HostName ${{ env.CLUSTER2_IP }}
+            User ${{ env.DEFAULT_USER }}
             ProxyJump bastion
             StrictHostKeyChecking no
+            ConnectTimeout 10
           EOF
 
-          # Добавляем хосты в known_hosts
+          # Add hosts to known_hosts
           ssh-keyscan -p ${{ env.BASTION_PORT }} ${{ env.BASTION_IP }} >> ~/.ssh/known_hosts
-          ssh -J ${{ env.BASTION_USER }}@${{ env.BASTION_IP }}:${{ env.BASTION_PORT }} \
-            ${{ env.REMOTE_USER }}@${{ env.HOST1_IP }} "exit" >/dev/null 2>&1 || true
-          ssh -J ${{ env.BASTION_USER }}@${{ env.BASTION_IP }}:${{ env.BASTION_PORT }} \
-            ${{ env.REMOTE_USER }}@${{ env.HOST2_IP }} "exit" >/dev/null 2>&1 || true
+          ssh-keyscan -p 22 ${{ env.CLUSTER1_IP }} >> ~/.ssh/known_hosts
+          ssh-keyscan -p 22 ${{ env.CLUSTER2_IP }} >> ~/.ssh/known_hosts
 
-      - name: Check Cluster 1 pods
+      - name: Test SSH connections
         run: |
-          echo "Checking pods in Cluster 1..."
-          ssh cluster1 "kubectl get pods -A --field-selector=status.phase!=Running --no-headers" > non_running_pods_cluster1.txt || echo "All pods healthy" > non_running_pods_cluster1.txt
+          echo "Testing connection to Cluster 1..."
+          if ! ssh -T cluster1 "echo 'Connection to Cluster 1 successful'"; then
+            echo "##[error]Failed to connect to Cluster 1"
+            exit 1
+          fi
           
-          if [ -s non_running_pods_cluster1.txt ] && grep -q -v "All pods healthy" non_running_pods_cluster1.txt; then
-            echo "cluster1_issues=true" >> $GITHUB_OUTPUT
-            echo "##[error] Problem pods found in Cluster 1"
-            cat non_running_pods_cluster1.txt
-          else
-            echo "cluster1_issues=false" >> $GITHUB_OUTPUT
-            echo "All pods in Cluster 1 are healthy"
+          echo "Testing connection to Cluster 2..."
+          if ! ssh -T cluster2 "echo 'Connection to Cluster 2 successful'"; then
+            echo "##[warning]Failed to connect to Cluster 2"
           fi
 
-      - name: Check Cluster 2 pods
+      - name: Check Cluster 1 status
+        id: cluster1_check
         run: |
-          echo "Checking pods in Cluster 2..."
-          ssh cluster2 "kubectl get pods -A --field-selector=status.phase!=Running --no-headers" > non_running_pods_cluster2.txt || echo "All pods healthy" > non_running_pods_cluster2.txt
+          echo "##[group]Checking Cluster 1 pods"
+          OUTPUT=$(ssh cluster1 "${{ env.KUBECTL_CMD }}" 2>&1 || true)
           
-          if [ -s non_running_pods_cluster2.txt ] && grep -q -v "All pods healthy" non_running_pods_cluster2.txt; then
-            echo "cluster2_issues=true" >> $GITHUB_OUTPUT
-            echo "##[error] Problem pods found in Cluster 2"
-            cat non_running_pods_cluster2.txt
+          if [[ $OUTPUT == *"Permission denied"* ]]; then
+            echo "##[error]Authentication failed for Cluster 1"
+            echo "has_issues=true" >> $GITHUB_OUTPUT
+            echo "error_type=auth_failure" >> $GITHUB_OUTPUT
+            echo "error_message=SSH authentication failed for Cluster 1" >> $GITHUB_OUTPUT
+          elif [[ -n $OUTPUT ]]; then
+            echo "##[error]Problem pods found in Cluster 1"
+            echo "$OUTPUT" > cluster1_issues.txt
+            echo "has_issues=true" >> $GITHUB_OUTPUT
+            echo "error_type=pod_issues" >> $GITHUB_OUTPUT
+            PODS_INFO=$(echo "$OUTPUT" | awk '{printf "%-40s %-20s %-10s\n", $1"/"$2, $3, $4}')
+            echo "pods_info<<EOF" >> $GITHUB_OUTPUT
+            echo "$PODS_INFO" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
           else
-            echo "cluster2_issues=false" >> $GITHUB_OUTPUT
-            echo "All pods in Cluster 2 are healthy"
+            echo "##[section]All pods in Cluster 1 are healthy"
+            echo "has_issues=false" >> $GITHUB_OUTPUT
           fi
+          
+          echo "Cluster 1 output:"
+          echo "$OUTPUT"
+          echo "##[endgroup]"
 
-      - name: Notify Slack
-        if: steps.cluster1_check.outputs.cluster1_issues == 'true' || steps.cluster2_check.outputs.cluster2_issues == 'true'
+      - name: Check Cluster 2 status
+        id: cluster2_check
         run: |
-          MESSAGE="*Kubernetes Pod Status Report*\n\n"
+          echo "##[group]Checking Cluster 2 pods"
+          OUTPUT=$(ssh cluster2 "${{ env.KUBECTL_CMD }}" 2>&1 || true)
           
-          if [ "${{ needs.monitor-pods.outputs.cluster1_issues }}" == "true" ]; then
-            MESSAGE+="*Cluster 1 Issues (${{ env.HOST1_IP }}):*\n"
-            MESSAGE+="\`\`\`$(cat non_running_pods_cluster1.txt)\`\`\`\n"
+          if [[ $OUTPUT == *"Permission denied"* ]]; then
+            echo "##[error]Authentication failed for Cluster 2"
+            echo "has_issues=true" >> $GITHUB_OUTPUT
+            echo "error_type=auth_failure" >> $GITHUB_OUTPUT
+            echo "error_message=SSH authentication failed for Cluster 2" >> $GITHUB_OUTPUT
+          elif [[ -n $OUTPUT ]]; then
+            echo "##[error]Problem pods found in Cluster 2"
+            echo "$OUTPUT" > cluster2_issues.txt
+            echo "has_issues=true" >> $GITHUB_OUTPUT
+            echo "error_type=pod_issues" >> $GITHUB_OUTPUT
+            PODS_INFO=$(echo "$OUTPUT" | awk '{printf "%-40s %-20s %-10s\n", $1"/"$2, $3, $4}')
+            echo "pods_info<<EOF" >> $GITHUB_OUTPUT
+            echo "$PODS_INFO" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
           else
-            MESSAGE+="*Cluster 1 (${{ env.HOST1_IP }}): All pods healthy*\n"
+            echo "##[section]All pods in Cluster 2 are healthy"
+            echo "has_issues=false" >> $GITHUB_OUTPUT
           fi
           
-          if [ "${{ needs.monitor-pods.outputs.cluster2_issues }}" == "true" ]; then
-            MESSAGE+="*Cluster 2 Issues (${{ env.HOST2_IP }}):*\n"
-            MESSAGE+="\`\`\`$(cat non_running_pods_cluster2.txt)\`\`\`"
+          echo "Cluster 2 output:"
+          echo "$OUTPUT"
+          echo "##[endgroup]"
+
+      - name: Send Slack notification
+        if: steps.cluster1_check.outputs.has_issues == 'true' || steps.cluster2_check.outputs.has_issues == 'true'
+        run: |
+          SLACK_MESSAGE=":kubernetes: *Kubernetes Cluster Status Report* :rotating_light:\n"
+          SLACK_MESSAGE+="*Execution Time:* $(date -u '+%Y-%m-%d %H:%M:%S UTC')\n\n"
+          
+          # Cluster 1 status
+          SLACK_MESSAGE+="*Cluster 1 (${{ env.CLUSTER1_IP }})*: "
+          if [ "${{ steps.cluster1_check.outputs.error_type }}" == "auth_failure" ]; then
+            SLACK_MESSAGE+=":x: *Authentication Failed*\n"
+            SLACK_MESSAGE+="> ${{ steps.cluster1_check.outputs.error_message }}\n"
+          elif [ "${{ steps.cluster1_check.outputs.has_issues }}" == "true" ]; then
+            SLACK_MESSAGE+=":warning: *Problem Pods Detected*\n"
+            SLACK_MESSAGE+="\`\`\`Namespace/Pod Name                       Status         Restarts\n"
+            SLACK_MESSAGE+="${{ steps.cluster1_check.outputs.pods_info }}\`\`\`\n"
           else
-            MESSAGE+="*Cluster 2 (${{ env.HOST2_IP }}): All pods healthy*"
+            SLACK_MESSAGE+=":white_check_mark: *All Pods Healthy*\n"
           fi
           
+          # Cluster 2 status
+          SLACK_MESSAGE+="\n*Cluster 2 (${{ env.CLUSTER2_IP }})*: "
+          if [ "${{ steps.cluster2_check.outputs.error_type }}" == "auth_failure" ]; then
+            SLACK_MESSAGE+=":x: *Authentication Failed*\n"
+            SLACK_MESSAGE+="> ${{ steps.cluster2_check.outputs.error_message }}\n"
+          elif [ "${{ steps.cluster2_check.outputs.has_issues }}" == "true" ]; then
+            SLACK_MESSAGE+=":warning: *Problem Pods Detected*\n"
+            SLACK_MESSAGE+="\`\`\`Namespace/Pod Name                       Status         Restarts\n"
+            SLACK_MESSAGE+="${{ steps.cluster2_check.outputs.pods_info }}\`\`\`\n"
+          else
+            SLACK_MESSAGE+=":white_check_mark: *All Pods Healthy*\n"
+          fi
+          
+          # Add workflow info
+          SLACK_MESSAGE+="\n*Workflow Information:*\n"
+          SLACK_MESSAGE+="Repository: $GITHUB_REPOSITORY\n"
+          SLACK_MESSAGE+="Workflow: $GITHUB_WORKFLOW\n"
+          SLACK_MESSAGE+="Run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          
+          echo "Sending Slack notification..."
           curl -X POST -H 'Content-type: application/json' \
-            --data "{\"text\":\"$MESSAGE\"}" \
-            ${{ secrets.SLACK_WEBHOOK_URL }}
+            --data "{\"text\":\"$SLACK_MESSAGE\"}" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
 
-      - name: Upload results
+      - name: Upload debug artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: pod-status-reports
+          name: cluster-debug-info
           path: |
-            non_running_pods_cluster1.txt
-            non_running_pods_cluster2.txt
+            cluster1_issues.txt
+            cluster2_issues.txt
+          retention-days: 3 
